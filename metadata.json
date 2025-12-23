@@ -1,0 +1,5 @@
+{
+  "name": "D Monofile",
+  "description": "A professional developer tool to flatten codebases into single documents, optimize context for AI ingestion, and generate comprehensive architecture summaries using Gemini.",
+  "requestFramePermissions": []
+}
