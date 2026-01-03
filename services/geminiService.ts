@@ -53,35 +53,56 @@ Output Format (Markdown):
 [A high-quality, long-form prompt that a developer can paste into another LLM (like Claude or ChatGPT) to generate the full functional code for these features from scratch based on this blueprint]
 `;
 
+const extractJsonArray = (text: string): string => {
+  const match = text.match(/\[[\s\S]*\]/);
+  return match ? match[0] : text;
+};
+
 export const generateAIInsights = async (
   flattenedCode: string, 
   files: FileNode[]
 ): Promise<{ summary: string; aiContext: string; concepts: ConceptBundle[] }> => {
   
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const model = "gemini-3-flash-preview"; 
-  const fileTree = files.map(f => f.path).join('\n');
-  const contextInput = `Structure:\n${fileTree}\n\nContent:\n${flattenedCode.substring(0, 500000)}`;
+  const apiKey = process.env.API_KEY;
+  if (!apiKey) throw new Error("API_KEY_MISSING");
 
-  const [summaryRes, contextRes, conceptsRes] = await Promise.all([
-    ai.models.generateContent({ model, contents: [{ text: PROMPT_SUMMARY }, { text: contextInput }] }),
-    ai.models.generateContent({ model, contents: [{ text: PROMPT_CONTEXT }, { text: contextInput }] }),
-    ai.models.generateContent({ 
-      model, 
-      contents: [{ text: PROMPT_CONCEPTS }, { text: contextInput }],
-      config: { 
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              id: { type: Type.STRING },
-              name: { type: Type.STRING },
-              description: { type: Type.STRING }
-            },
-            required: ["id", "name", "description"]
-          }
+  const ai = new GoogleGenAI({ apiKey });
+  const model = "gemini-3-flash-preview"; 
+  const fileTree = files.slice(0, 200).map(f => f.path).join('\n');
+  const contextInput = `Structure:\n${fileTree}\n\nContent:\n${flattenedCode.substring(0, 400000)}`;
+
+  const runTask = async (prompt: string, config?: any) => {
+    try {
+      const res = await ai.models.generateContent({
+        model,
+        contents: [{ text: prompt }, { text: contextInput }],
+        config
+      });
+      return res.text || "";
+    } catch (e: any) {
+      console.error(`AI Task Failed: ${e.message}`);
+      if (e.message?.includes("API key not valid") || e.message?.includes("INVALID_ARGUMENT") || e.message?.includes("400")) {
+          throw new Error("API_KEY_INVALID");
+      }
+      return `[Insight unavailable: ${e.message}]`;
+    }
+  };
+
+  const [summary, aiContext, conceptsRaw] = await Promise.all([
+    runTask(PROMPT_SUMMARY),
+    runTask(PROMPT_CONTEXT),
+    runTask(PROMPT_CONCEPTS, {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            id: { type: Type.STRING },
+            name: { type: Type.STRING },
+            description: { type: Type.STRING }
+          },
+          required: ["id", "name", "description"]
         }
       }
     })
@@ -89,50 +110,58 @@ export const generateAIInsights = async (
 
   let concepts: ConceptBundle[] = [];
   try {
-    concepts = JSON.parse(conceptsRes.text || "[]");
+    if (conceptsRaw) {
+      const jsonStr = extractJsonArray(conceptsRaw);
+      concepts = JSON.parse(jsonStr);
+    }
   } catch (e) {
-    console.error("Failed to parse concepts", e);
+    console.error("Failed to parse concepts JSON. Raw response:", conceptsRaw, e);
+    // Fallback if parsing fails
+    concepts = [
+      { id: 'core-arch', name: 'Core Architecture', description: 'The fundamental structure of the provided codebase.' }
+    ];
   }
 
-  return {
-    summary: summaryRes.text || "",
-    aiContext: contextRes.text || "",
-    concepts
-  };
+  return { summary, aiContext, concepts };
 };
 
 export const recreateFeatureContext = async (
   flattenedCode: string,
   selectedConcepts: ConceptBundle[]
 ): Promise<string> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const apiKey = process.env.API_KEY;
+  if (!apiKey) throw new Error("API_KEY_MISSING");
+
+  const ai = new GoogleGenAI({ apiKey });
   const model = "gemini-3-flash-preview";
   const conceptNames = selectedConcepts.map(c => c.name).join(", ");
   const prompt = PROMPT_RECREATOR.replace("{{CONCEPTS}}", conceptNames);
-
-  const response = await ai.models.generateContent({
-    model,
-    contents: [
-      { text: prompt },
-      { text: `Codebase Context:\n${flattenedCode.substring(0, 500000)}` }
-    ]
-  });
-
-  return response.text || "Failed to generate recreation package.";
+  
+  try {
+    const response = await ai.models.generateContent({
+      model,
+      contents: [
+        { text: prompt },
+        { text: `Context:\n${flattenedCode.substring(0, 400000)}` }
+      ]
+    });
+    return response.text || "Failed to generate extraction.";
+  } catch (e: any) {
+    console.error(`Recreation Task Failed: ${e.message}`);
+    if (e.message?.includes("API key not valid") || e.message?.includes("INVALID_ARGUMENT") || e.message?.includes("400")) {
+        throw new Error("API_KEY_INVALID");
+    }
+    throw e;
+  }
 };
 
 export const startCodebaseChat = (flattenedCode: string): Chat => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const apiKey = process.env.API_KEY;
+  const ai = new GoogleGenAI({ apiKey: apiKey || "" });
   return ai.chats.create({
     model: 'gemini-3-flash-preview',
     config: {
-      systemInstruction: `You are a Codebase Intelligence Assistant. 
-      You have access to the entire flattened codebase provided below. 
-      Your goal is to answer developer questions, explain logic, suggest refactors, and identify bugs based EXCLUSIVELY on this context.
-      
-      Codebase Context:
-      ${flattenedCode.substring(0, 500000)}
-      `
+      systemInstruction: `You are a Codebase Intelligence Assistant. Analyze this code and answer developer questions based on its contents.\n\nCodebase Context:\n${flattenedCode.substring(0, 400000)}`
     }
   });
 };

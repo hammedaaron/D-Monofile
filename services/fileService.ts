@@ -1,15 +1,30 @@
 import { FileNode, ProcessingStats } from '../types';
 
-// Declare JSZip globally as it is loaded via CDN
 declare const JSZip: any;
 
-const IGNORED_FOLDERS = ['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', '__pycache__'];
+const IGNORED_FOLDERS = ['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', '__pycache__', '.gradle', '.idea', 'vendor', 'Pods', 'target'];
 const IGNORED_FILES = ['.DS_Store', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'];
-const BINARY_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'ico', 'pdf', 'exe', 'bin', 'zip', 'tar', 'gz'];
+
+// Specific extensions to treat as text for analysis
+const TEXT_EXTENSIONS = [
+  'html', 'css', 'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'json', 'yaml', 'yml', 'xml', 'md', 'txt',
+  'py', 'rb', 'php', 'go', 'rs', 'java', 'kt', 'c', 'cpp', 'h', 'hpp', 'cs', 'sh', 'bash',
+  'sol', 'wasm', 'abi', 'contract', 'dockerfile', 'gradle', 'properties', 'toml', 'env', 'local',
+  'dart', 'swift', 'm', 'h', 'cmake', 'makefile', 'proto'
+];
+
+const BINARY_EXTENSIONS = [
+  'apk', 'aab', 'ipa', 'exe', 'msi', 'app', 'dmg', 'pkg', 'deb', 'rpm', 'appimage',
+  'png', 'jpg', 'jpeg', 'gif', 'ico', 'pdf', 'zip', 'tar', 'gz', 'jar', 'war', 'node', 'whl',
+  'pb', 'tflite', 'bin', 'dll', 'so', 'dylib'
+];
 
 export const isBinary = (filename: string): boolean => {
   const ext = filename.split('.').pop()?.toLowerCase() || '';
-  return BINARY_EXTENSIONS.includes(ext);
+  // If it's in our text list, it's definitely not binary
+  if (TEXT_EXTENSIONS.includes(ext)) return false;
+  // Check if it's in the known binary list or doesn't have an extension
+  return BINARY_EXTENSIONS.includes(ext) || !filename.includes('.');
 };
 
 export const readFileContent = (file: File): Promise<string> => {
@@ -23,35 +38,39 @@ export const readFileContent = (file: File): Promise<string> => {
 
 export const processFiles = async (fileList: FileList): Promise<FileNode[]> => {
   const files: FileNode[] = [];
-  
-  // Convert FileList to Array
   const rawFiles = Array.from(fileList);
   
-  // Check for ZIPs first
   const zipFiles = rawFiles.filter(f => f.name.endsWith('.zip'));
   const normalFiles = rawFiles.filter(f => !f.name.endsWith('.zip'));
 
-  // Process Normal Files
   for (const file of normalFiles) {
     const path = file.webkitRelativePath || file.name;
     if (shouldIgnore(path)) continue;
-    if (isBinary(path)) continue;
 
     try {
-      const content = await readFileContent(file);
-      files.push({
-        path,
-        name: file.name,
-        extension: file.name.split('.').pop() || '',
-        content,
-        size: file.size
-      });
+      if (isBinary(path)) {
+        files.push({
+          path,
+          name: file.name,
+          extension: file.name.split('.').pop() || '',
+          content: `[INGESTED BINARY METADATA: ${file.name} | Size: ${file.size} bytes | Platform: ${detectPlatform(file.name)}]`,
+          size: file.size
+        });
+      } else {
+        const content = await readFileContent(file);
+        files.push({
+          path,
+          name: file.name,
+          extension: file.name.split('.').pop() || '',
+          content,
+          size: file.size
+        });
+      }
     } catch (e) {
       console.warn(`Failed to read file: ${file.name}`);
     }
   }
 
-  // Process ZIP Files (using JSZip from CDN)
   if (zipFiles.length > 0 && typeof JSZip !== 'undefined') {
     for (const zipFile of zipFiles) {
       try {
@@ -61,20 +80,28 @@ export const processFiles = async (fileList: FileList): Promise<FileNode[]> => {
         for (const filename of entries) {
           if (shouldIgnore(filename)) continue;
           if (zip.files[filename].dir) continue;
-          if (isBinary(filename)) continue;
 
-          const content = await zip.files[filename].async('string');
-          files.push({
-            path: filename, // ZIP paths are usually relative roots
-            name: filename.split('/').pop() || filename,
-            extension: filename.split('.').pop() || '',
-            content,
-            size: content.length // Approximation
-          });
+          if (isBinary(filename)) {
+            files.push({
+              path: filename,
+              name: filename.split('/').pop() || filename,
+              extension: filename.split('.').pop() || '',
+              content: `[INGESTED BINARY IN ZIP: ${filename}]`,
+              size: 0
+            });
+          } else {
+            const content = await zip.files[filename].async('string');
+            files.push({
+              path: filename,
+              name: filename.split('/').pop() || filename,
+              extension: filename.split('.').pop() || '',
+              content,
+              size: content.length
+            });
+          }
         }
       } catch (e) {
         console.error("Error unzipping", e);
-        throw new Error("Failed to process ZIP file.");
       }
     }
   }
@@ -82,11 +109,21 @@ export const processFiles = async (fileList: FileList): Promise<FileNode[]> => {
   return files.sort((a, b) => a.path.localeCompare(b.path));
 };
 
+const detectPlatform = (filename: string): string => {
+  const ext = filename.split('.').pop()?.toLowerCase();
+  if (['apk', 'aab'].includes(ext!)) return 'Android';
+  if (['ipa'].includes(ext!)) return 'iOS';
+  if (['exe', 'msi'].includes(ext!)) return 'Windows Desktop';
+  if (['dmg', 'pkg'].includes(ext!)) return 'macOS Desktop';
+  if (['deb', 'rpm'].includes(ext!)) return 'Linux';
+  if (['sol'].includes(ext!)) return 'Blockchain/Web3';
+  if (['jar', 'war', 'whl'].includes(ext!)) return 'Backend Package';
+  return 'General Asset';
+};
+
 const shouldIgnore = (path: string): boolean => {
   const parts = path.split('/');
-  // Check if any part of the path is in ignored folders
   if (parts.some(part => IGNORED_FOLDERS.includes(part))) return true;
-  // Check filename
   const filename = parts[parts.length - 1];
   if (IGNORED_FILES.includes(filename)) return true;
   return false;
@@ -102,7 +139,9 @@ export const calculateStats = (files: FileNode[]): ProcessingStats => {
 
   files.forEach(f => {
     stats.totalSize += f.size;
-    stats.totalLines += f.content.split('\n').length;
+    if (!f.content.startsWith('[INGESTED BINARY')) {
+        stats.totalLines += f.content.split('\n').length;
+    }
     const type = f.extension.toUpperCase() || 'UNKNOWN';
     stats.fileTypes[type] = (stats.fileTypes[type] || 0) + 1;
   });
